@@ -153,6 +153,7 @@ class ModelledTrajectory:
 
         return ModelIterator(self._simulation, self._tu, select)
 
+    
     def getPotentialEnergy(self, returnQuantity:bool = False):
         '''Return the potential energy of the current state of the simulation'''
 
@@ -163,40 +164,56 @@ class ModelledTrajectory:
         else:
             return pot.value_in_unit(kilojoule_per_mole)
 
+        
     def minimizeEnergy(self, tolerance:float = 10, maxIterations:int = 0):
         '''Passes call for energy minimization in the simulation'''
 
-        self._simulation.minimizeEnergy(tolerance = Quantity(value=tolerance, unit=kilojoule/mole), maxIterations = maxIterations)
+        self._simulation.minimizeEnergy(tolerance = Quantity(value=tolerance, unit=kilojoule/mole), maxIterations=maxIterations)
 
+        
     def pdbReporter(self, repfile:str = 'output.pdb'):
         '''
         Write current coordinates to pdb file.
 
         Uses the openm pdbreporter to write trajectories to a file. If a certain file is specified for the first time a new reporter will be created for it. Calling this again will add an extra frame to that file.
         '''
-        
+
         state = self._simulation.context.getState(getPositions=True)
         if repfile not in self._reporters:
             self._reporters[repfile] = app.PDBxReporter(repfile, 1)
         
         self._reporters[repfile].report(self._simulation, state)
-            
-    def constrainAtoms(self, selections:List[str]):
-        '''
-        Constrain selections of atoms with MDA selection language
 
-        For each selection string provided in the input list this function will constrain the positions of atoms in the simulation box by setting their mass to 0. Applies to all frames in the simulation and not just the current one! As of yet non-reversible. 
-        '''
-
-        for select in selections:
-            bbgroup = self._tu.select_atoms(select, sorted=False)
-            bbIDs = [atm.ix for atm in bbgroup]
-            for bbid in bbIDs:
-                self._system.setParticleMass(bbid, 0*amu)
         
-        self._simulation.context.reinitialize()
-            
+    def constrainAtoms(self, selection:List[int]):
+        '''
+        Constrain selection of atoms in the simulation
 
+        Atom ID provided in the input list this function will constrain its postion in the simulation box by setting their mass to 0. Applies to all frames in the simulation and not just the current one! As of yet non-reversible. 
+        '''
+
+        for i in selection:
+                self._system.setParticleMass(i, 0*amu)
+        self._simulation.context.reinitialize()
+
+        
+    def getForces(self, asNumpy:bool = True, returnQuantity:bool = False):
+        '''Report on the current forces in the system'''
+
+        state = self._simulation.context.getState(getForces=True)
+        f = state.getForces(asNumpy)
+        if returnQuantity:
+            return f
+        else:
+            return f.value_in_unit(kilojoule / (nanometer * mole))
+        
+    def selectIDs(self, selection:str):
+        '''Passes a string of MDA atom selection language to the universe and returns selected atom IDs'''
+
+        selected = self._tu.select_atoms(selection)
+        return [atm.ix for atm in selected]
+
+        
 class ModelIterator:
     '''
     Iterator over the specified frames in a modelledtrajectory.
