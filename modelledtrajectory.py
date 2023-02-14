@@ -96,7 +96,7 @@ class ModelledTrajectory:
 
     '''
     
-    def __init__(self, protein: str, smallmol: str, trajTop: str, trajectory:Optional[str] = None, xyz:Tuple[float, float, float] = (10, 10, 10), forces:List[str] = ['amber/protein.ff14SB.xml', 'amber/tip3p_standard.xml', 'amber/tip3p_HFE_multivalent.xml'], nonbondedMethod:str = 'NoCutoff', nonbondedCutoff:float = 1):
+    def __init__(self, protein: str, smallmol: str, trajTop: str, trajectory:Optional[str] = None, periodicBox:Tuple[float, float, float] = (10, 10, 10), forces:List[str] = ['amber/protein.ff14SB.xml', 'amber/tip3p_standard.xml', 'amber/tip3p_HFE_multivalent.xml'], nonbondedMethod:str = 'NoCutoff', nonbondedCutoff:float = 1):
         #load the trajectory
         if trajectory == None:
             self._tu = mda.Universe(trajTop)
@@ -115,9 +115,9 @@ class ModelledTrajectory:
         #Create a topology of the molecules combined
         mod = app.Modeller(pdbProt.getTopology(), pdbProt.positions)
         mod.add(smalltop, array2vec3(offTop.get_positions()))
-        x = openmm.Vec3(xyz[0],0,0)
-        y = openmm.Vec3(0,xyz[1],0)
-        z = openmm.Vec3(0,0,xyz[2])
+        x = openmm.Vec3(periodicBox[0],0,0)
+        y = openmm.Vec3(0,periodicBox[1],0)
+        z = openmm.Vec3(0,0,periodicBox[2])
         topology = mod.getTopology()
         topology.setPeriodicBoxVectors([x, y, z])
 
@@ -180,7 +180,7 @@ class ModelledTrajectory:
 
         state = self._simulation.context.getState(getPositions=True)
         if repfile not in self._reporters:
-            self._reporters[repfile] = app.PDBxReporter(repfile, 1)
+            self._reporters[repfile] = app.PDBReporter(repfile, 1)
         
         self._reporters[repfile].report(self._simulation, state)
 
