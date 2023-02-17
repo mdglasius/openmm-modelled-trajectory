@@ -103,6 +103,7 @@ class ModelledTrajectory:
         else:
             self._tu = mda.Universe(trajTop, trajectory)
         self._reporters = {}
+        self._slices = {}
 
         #load the molecules and add a template generator for the small molecule
         #the protein is expected to be covered by the normal forcefield specified
@@ -114,7 +115,7 @@ class ModelledTrajectory:
 
         #Create a topology of the molecules combined
         mod = app.Modeller(pdbProt.getTopology(), pdbProt.positions)
-        mod.add(smalltop, array2vec3(offTop.get_positions()))
+        mod.add(smalltop, array2vec3(offTop.get_positions(), nanometer))
         x = openmm.Vec3(periodicBox[0],0,0)
         y = openmm.Vec3(0,periodicBox[1],0)
         z = openmm.Vec3(0,0,periodicBox[2])
@@ -138,7 +139,7 @@ class ModelledTrajectory:
         '''Move the simulation box to frame index'''
 
         self._tu.trajectory[index]
-        pos = array2vec3([atm.position for atm in self._tu.atoms])
+        pos = array2vec3([atm.position for atm in self._tu.atoms], angstrom)
         self._simulation.context.setPositions(pos)
 
 
@@ -148,10 +149,9 @@ class ModelledTrajectory:
         return len(self._tu.trajectory)
             
 
-    def frames(self, select:List[int]=[]):
-        '''To iterate over all, or an ordered selection specified by select, of the frames'''
-
-        return ModelIterator(self._simulation, self._tu, select)
+    def frames(self, trajslice = None, select:List[int]=[]):
+        '''Iterate over (a slice of ) the trajectory, or a different trajectory for the same system'''
+        return ModelIterator(self, trajslice, select)
 
     
     def getPotentialEnergy(self, returnQuantity:bool = False):
@@ -213,7 +213,34 @@ class ModelledTrajectory:
         selected = self._tu.select_atoms(selection)
         return [atm.ix for atm in selected]
 
-        
+    def pickStateForSlice(self, slicename:str):
+        '''Adds the current simulation state to a TrajSlice object'''
+        if slicename not in self._slices:
+            self._slices[slicename] = TrajSlice(len(self._tu.atoms))
+
+        state = self._simulation.context.getState(getPositions=True)
+        self._slices[slicename].addStateFrame(state)
+
+    def getSlice(self, slicename:str):
+        '''Finalize and return a trajectory slice, removing it from internal dict'''
+        fetchSlice = self._slices.pop(slicename)
+        fetchSlice.finalize()
+        return fetchSlice
+
+    def sliceTrajectory(self, select):
+        '''Extract coordinates for a selection of frames from the trajectory'''
+        currentframe = self._tu.trajectory.frame
+        newslice = TrajSlice(len(self._tu.atoms))
+        for i in select:
+            self._tu.trajectory[i]
+            newslice.addUFrame(self._tu)
+
+        self._tu.trajectory[currentframe]
+        newslice.finalize()
+        return newslice
+            
+
+    
 class ModelIterator:
     '''
     Iterator over the specified frames in a modelledtrajectory.
@@ -225,57 +252,130 @@ class ModelIterator:
     sim (openmm.app.simulation.Simulation):
         The openMM simulation box that is changed for each iteration
 
-    u (MDAnalysis.core.universe):
-      the MDAnalysis universe that contains the coordinates to be loaded in the simulation box
-    
+    trajectory: numpy array of atom coordinates per frame to loop over.
+
     select ( [int] ): Optional list of integers. When specified will iterate over the specific frames in this list.
     '''
     
-    def __init__(self, sim, u, select=[]):
-        if select == []:
-            self.numits = len(u.trajectory)
-            self.selected=False
-        else:
+    def __init__(self, mt:ModelledTrajectory, trajectory = None, select:List[int] = []):
+        if trajectory != None:
+            self.numits = len(trajectory)
+            self.trajectory = trajectory
+            self.tb = True
+            self.sb = False
+        elif select != []:
             self.numits = len(select)
-            self.selected=True
-        self.sim = sim
-        self.u = u
+            self.select = select
+            self.sb = True
+            self.tb = False
+        else:
+            self.numits = len(mt)
+            self.sb = False
+            self.tb = False
+        self.mt = mt
         self.iteration = 0
-        self.select = select
-    
+        
     def __iter__(self):
         return self
 
     def __next__(self):
         if self.iteration < self.numits:
             i = self.iteration
-            if self.selected:
-                self.u.trajectory[self.select[i]]
+            
+            if self.tb:
+                curpos = array2vec3([vec for vec in self.trajectory[i]], nanometer)
+                
+            elif self.sb:
+                self.mt._tu.trajectory[self.select[i]]
+                curpos = array2vec3([atm.position for atm in self.mt._tu.atoms], angstrom)
+                
             else:
-                self.u.trajectory[i]
-            pos = array2vec3([atm.position for atm in self.u.atoms])
-            self.sim.context.setPositions(pos)
+                self.mt._tu.trajectory[i]
+                curpos = array2vec3([atm.position for atm in self.mt._tu.atoms], angstrom)
+                
+            self.mt._simulation.context.setPositions(curpos)
             self.iteration += 1
             return i
         else:
-            self.u.trajectory[0]
-            pos = array2vec3([atm.position for atm in self.u.atoms])
-            self.sim.context.setPositions(pos)
+            self.mt[0]
             raise StopIteration
     def __len__(self):
         return self.numits
 
 
+
+
+
+
+class TrajSlice:
+    '''
+    Storage for coordinates separate from the mda Universe
+    
+    Object used to store selected parts of the trajectory, or an altered version of the trajectory, 
+    without the need to create completely new universe. 
+
+    '''
+    
+    def __init__(self, numAtoms):
+        self.numAtoms = numAtoms
+        self.buildList = []
+        self.trajectory = None
+        self.fin = False
+
+    def __getitem__(self, index):
+        if self.fin:
+            return self.trajectory[index, :, :]
+        else:
+            return self.buildList[index]
+
+    def __len__(self):
+        return len(self.trajectory)
+    
+    def addStateFrame(self, state):
+        if not self.fin:
+            newframe = np.zeros([self.numAtoms, 3])
+            for i, (x, y, z) in enumerate(state.getPositions(asNumpy=True)):
+                newframe[i, :] = x.value_in_unit(nanometer), y.value_in_unit(nanometer), z.value_in_unit(nanometer)
+                
+            self.buildList.append(newframe)
+        else:
+            print('Trajectory has already been finalized')
+        
+    def addUFrame(self, u):
+        
+        if not self.fin:
+            newframe = np.zeros([self.numAtoms, 3])
+            for i, atm in enumerate(u.atoms):
+                pos = atm.position * 0.1
+                newframe[i, :] = pos[:]
+            self.buildList.append(newframe)
+        else:
+            print('Trajectory has already been finalized')
+
+            
+    def finalize(self):
+        if not self.fin:
+            self.trajectory = np.zeros([len(self.buildList),self.numAtoms,3])
+            for i,frame in enumerate(self.buildList):
+                self.trajectory[i, :,:] = frame
+
+            self.buildlist = []
+            self.fin=True
+            
+        else:
+            print('Trajectory has already been finalized')
+
+            
 '''
 Functions
 ---------
 '''
 
-def array2vec3(positions):
+def array2vec3(positions, unit):
     '''Translation between the mda and openMM coordinates
 
-    MDAnalysis stores the coordinates as floats, in angstrom. Openmm needs the coordinates in its own Vec3 format with units explicitly provided.'''
-    return [openmm.Vec3(r[0], r[1], r[2])*0.1*nanometer for r in positions]
+    MDAnalysis stores the coordinates as floats, Openmm needs the coordinates in its own Vec3 format with units explicitly provided.'''
+    return [openmm.Vec3(r[0], r[1], r[2])*unit for r in positions]
 
 
 
