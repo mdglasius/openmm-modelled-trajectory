@@ -24,7 +24,10 @@ _nbmethods:
 
 '''
 import numpy as np
+import numpy.linalg as la
 from typing import Tuple, Optional, List
+
+from tqdm import tqdm
 
 from openff.toolkit import Molecule as offMol
 from openff.interchange import Interchange
@@ -36,7 +39,7 @@ from openmmforcefields.generators import GAFFTemplateGenerator
 
 import MDAnalysis as mda
 from MDAnalysis.analysis import distances
-
+from MDAnalysis.coordinates.memory import MemoryReader
 
 
 
@@ -96,7 +99,7 @@ class ModelledTrajectory:
 
     '''
     
-    def __init__(self, protein: str, smallmol: str, trajTop: str, trajectory:Optional[str] = None, periodicBox:Tuple[float, float, float] = (10, 10, 10), forces:List[str] = ['amber/protein.ff14SB.xml', 'amber/tip3p_standard.xml', 'amber/tip3p_HFE_multivalent.xml'], nonbondedMethod:str = 'NoCutoff', nonbondedCutoff:float = 1):
+    def __init__(self, protein: str, smallmol: str, trajTop: str, trajectory:Optional[str] = None, periodicBox:Tuple[float, float, float] = (10, 10, 10), forces:List[str] = ['amber/protein.ff14SB.xml'], nonbondedMethod:str = 'NoCutoff', nonbondedCutoff:float = 1, T:float = 300, stepsize:float = 0.002):
         #load the trajectory
         if trajectory == None:
             self._tu = mda.Universe(trajTop)
@@ -104,6 +107,7 @@ class ModelledTrajectory:
             self._tu = mda.Universe(trajTop, trajectory)
         self._reporters = {}
         self._slices = {}
+        self.T = T
 
         #load the molecules and add a template generator for the small molecule
         #the protein is expected to be covered by the normal forcefield specified
@@ -122,13 +126,13 @@ class ModelledTrajectory:
         topology = mod.getTopology()
         topology.setPeriodicBoxVectors([x, y, z])
 
-        #Set up a Forcedield for the system, adding the small model parameters from GAFF
+        #Set up a Forcefield for the system, adding the small model parameters from GAFF
         forcefield = app.ForceField()
         for force in forces:
             forcefield.loadFile(force)
         forcefield.registerTemplateGenerator(gaff.generator)
         self._system = forcefield.createSystem(topology, nonbondedMethod=_nbmethods[nonbondedMethod], nonbondedCutoff=nonbondedCutoff*nanometer)
-        integrator = openmm.LangevinMiddleIntegrator(300*kelvin, 1/picosecond, 0.0004*picoseconds)
+        integrator = openmm.LangevinMiddleIntegrator(T*kelvin, 1/picosecond, stepsize*picoseconds)
         #Create the simulation box that provides the environment for measurements along the trajectory
         self._simulation = app.Simulation(topology, self._system, integrator)
 
@@ -169,6 +173,90 @@ class ModelledTrajectory:
         '''Passes call for energy minimization in the simulation'''
 
         self._simulation.minimizeEnergy(tolerance = Quantity(value=tolerance, unit=kilojoule/mole), maxIterations=maxIterations)
+        
+    
+    def gridSim(self, steps:int, forcePicks:List[int], outputfolder:str = 'output', reportsteps:int = 0, select:List[int]=[], saveCheckpoint:bool = False):
+        '''
+        Run a Simulation on each (selected) point in the pseudotrajectory/grid. 
+
+        Reports resulting trajectories and potential data in a separate file for each visited frame/gridpoint, in a folder specified in the input. 
+        If any simulations fail (e.g. due to a too large timestep) the number of the failed sim is stored and the function moves on to the next frame.
+        Will optionally output (average) forces on selected atoms. 
+        
+        '''
+
+        if reportsteps == 0:
+            reportsteps = steps
+
+        success = []
+        fail = []
+        forcenames=[]
+        for i, f in enumerate(self._system.getForces()):
+                f.setForceGroup(i)
+                forcenames.append(f.getName())
+
+        with open(outputfolder+'/forces.txt', 'w') as ff:
+            ff.write(str(forcenames))
+        
+        
+        for i in self.frames(select=select):
+            if select == []:
+                n = i
+            else:
+                n = select[i]
+
+            self._simulation.context.setVelocitiesToTemperature(self.T)
+            self._simulation.reporters.append(app.DCDReporter(outputfolder+'/trajectory_{}.dcd'.format(n), reportsteps))
+            self._simulation.reporters.append(ProbeReporter(outputfolder+'/data_{}.csv'.format(n), reportsteps, forcePicks, len(self._system.getForces())))
+            try:
+                self._simulation.step(steps)
+            except:
+                fail.append(n)
+            else:
+                success.append(n)
+                if saveCheckpoint:
+                    self._simulation.saveCheckpoint(outputfolder+'/checkpoint_{}.chk'.format(n))
+                    
+            self._simulation.reporters = []
+            self._simulation.currentStep = 0
+
+            
+
+
+        return success, fail
+
+
+    def gridMinimize(self, maxIt:int = 0, tfile:str = 'minimized_trajectory.dcd', select:List[int]=[], printProgress = False):
+        '''
+        Run a Simulation on each (selected) point in the pseudotrajectory/grid. 
+
+        Returns lists specifying which minimizations succeeded or failed. Saves a pseudotrajectory of all succesfully minimized frames.'''
+        success = []
+        fail = []
+
+        rep = app.DCDReporter(tfile, 1)
+        for i in self.frames(select=select):
+            if select == []:
+                n = i
+            else:
+                n = select[i]
+            try:
+                self._simulation.minimizeEnergy(maxIterations = maxIt)
+            except:
+                if printProgress:
+                    print('Minimization of gridpoint {} failed'.format(n))
+                fail.append(n)
+            else:
+                if printProgress:
+                    print('Minimization of gridpoint {} completed'.format(n))
+                state = self._simulation.context.getState(getPositions=True)
+                rep.report(self._simulation, state)
+                success.append(n)
+            
+        return success, fail
+
+    def getForceNames(self):
+        return [f.getName() for f in self._system.getForces()]
 
         
     def pdbReporter(self, repfile:str = 'output.pdb'):
@@ -227,7 +315,7 @@ class ModelledTrajectory:
         fetchSlice.finalize()
         return fetchSlice
 
-    def sliceTrajectory(self, select):
+    def sliceTrajectory(self, select:List[int]):
         '''Extract coordinates for a selection of frames from the trajectory'''
         currentframe = self._tu.trajectory.frame
         newslice = TrajSlice(len(self._tu.atoms))
@@ -238,7 +326,16 @@ class ModelledTrajectory:
         self._tu.trajectory[currentframe]
         newslice.finalize()
         return newslice
-            
+
+    def sliceUniverse(self, trajectory = None, select:List[int]=[]):
+        '''Take a trajslice object and create a copy of the universe with this trajectory'''
+        if trajectory == None:
+            trajectory = self.sliceTrajectory(select)
+
+        newU = mda.Merge(self._tu.atoms)
+        newU.load_new(trajectory[:]*10, format=MemoryReader, order='fac')
+
+        return newU
 
     
 class ModelIterator:
@@ -258,44 +355,44 @@ class ModelIterator:
     '''
     
     def __init__(self, mt:ModelledTrajectory, trajectory = None, select:List[int] = []):
+        self.numits = len(mt)
+        self.sb = False
+        self.tb = False
+        self.mt = mt
+        self.iteration = 0
+
         if trajectory != None:
             self.numits = len(trajectory)
             self.trajectory = trajectory
             self.tb = True
-            self.sb = False
-        elif select != []:
+            
+        if select != []:
             self.numits = len(select)
             self.select = select
             self.sb = True
-            self.tb = False
-        else:
-            self.numits = len(mt)
-            self.sb = False
-            self.tb = False
-        self.mt = mt
-        self.iteration = 0
+
         
     def __iter__(self):
         return self
 
     def __next__(self):
         if self.iteration < self.numits:
-            i = self.iteration
+            if self.sb:
+                i = self.select[self.iteration]
+            else:
+                i = self.iteration
             
             if self.tb:
                 curpos = array2vec3([vec for vec in self.trajectory[i]], nanometer)
-                
-            elif self.sb:
-                self.mt._tu.trajectory[self.select[i]]
-                curpos = array2vec3([atm.position for atm in self.mt._tu.atoms], angstrom)
-                
             else:
                 self.mt._tu.trajectory[i]
                 curpos = array2vec3([atm.position for atm in self.mt._tu.atoms], angstrom)
                 
             self.mt._simulation.context.setPositions(curpos)
             self.iteration += 1
-            return i
+            return (self.iteration - 1)
+            
+    
         else:
             self.mt[0]
             raise StopIteration
@@ -312,7 +409,9 @@ class TrajSlice:
     Storage for coordinates separate from the mda Universe
     
     Object used to store selected parts of the trajectory, or an altered version of the trajectory, 
-    without the need to create completely new universe. 
+    without the need to create completely new universe. Will first keep a list of frames where new
+    frames can be appended. When finalizing all the frames are combined into one numpy array
+    for efficiency.
 
     '''
     
@@ -332,6 +431,7 @@ class TrajSlice:
         return len(self.trajectory)
     
     def addStateFrame(self, state):
+        '''Append a new frame to the list building the trajectory'''
         if not self.fin:
             newframe = np.zeros([self.numAtoms, 3])
             for i, (x, y, z) in enumerate(state.getPositions(asNumpy=True)):
@@ -365,6 +465,34 @@ class TrajSlice:
         else:
             print('Trajectory has already been finalized')
 
+
+class ProbeReporter():
+
+    def __init__(self, f:str, reportInterval:int, selection:List[int], nforcegroups:int = 1):
+        self._out = open(f, 'w')
+        self._reportInterval = reportInterval
+        self._probeIDs = selection
+        self._nf = nforcegroups
+
+    def __del__(self):
+        self._out.close()
+
+    def describeNextReport(self, simulation):
+        steps = self._reportInterval - simulation.currentStep%self._reportInterval
+        return (steps, False, False, False, False, None)
+
+    def report(self, simulation, state):
+        data = ['']*self._nf
+        for i in range(self._nf):
+            s2 = simulation.context.getState(getForces=True, getEnergy=True, groups = {i})
+            forces = s2.getForces(asNumpy=True).value_in_unit(kilojoules/mole/nanometer)
+            pot = s2.getPotentialEnergy().value_in_unit(kilojoules/mole)
+
+            data[i] = str(pot)+','+str(np.array(np.mean(forces[self._probeIDs], 0)))
+            
+        self._out.write(','.join(data)+'\n')
+        
+
             
 '''
 Functions
@@ -376,6 +504,57 @@ def array2vec3(positions, unit):
 
     MDAnalysis stores the coordinates as floats, Openmm needs the coordinates in its own Vec3 format with units explicitly provided.'''
     return [openmm.Vec3(r[0], r[1], r[2])*unit for r in positions]
+
+def draw_force_tcl(mt, df, colname, filename, posselect):
+    mag = df[colname].apply(la.norm)
+    scaled = (mag - mag.min()) / (mag.max() - mag.min())
+    unit = df[colname] / mag
+    
+    
+    sorting = np.argsort(-1*mag).tolist()
+    with open(filename+'.tcl', 'w') as ftcl:
+        
+        ftcl.write('color scale method GWR\n')
+        
+        for n in tqdm(mt.frames(select = sorting)):
+            i = sorting[n]
+            r = mt._tu.atoms.positions[mt.selectIDs(posselect), :][0]
+            
+            cosr = np.dot(unit[i], r / la.norm(r))
+            c= ( (cosr + 1)/2 )
+            
+            start = r - 0.6*unit[i]
+            end = r + 0.6*unit[i]
+
+            ftcl.write('graphics top color {}\n'.format(int(np.ceil(1023*c) + 33)))
+            ftcl.write('graphics top cone {{{} {} {}}} {{{} {} {}}} radius {}\n'.format(
+                start[0],start[1], start[2], end[0], end[1], end[2], 0.1 + 0.4*scaled[i]))
+
+
+def draw_potential_tcl(mt, df, colname, filename, posselect, sel):
+
+    sorting = np.argsort(df[colname]).tolist()
+    pots = df[colname].iloc[sorting[:sel]] - df[colname].iloc[sorting[:sel]].min()
+    med = pots.median()
+    frac1 = 2*med
+    frac2 = 2*(pots.max() - med)
+
+    pots=pots.tolist()
+    
+    with open(filename+'.tcl', 'w') as ftcl:
+        
+        ftcl.write('color scale method GWR\n')
+        
+        for n in tqdm(mt.frames(select=sorting[:sel])):
+            r = mt._tu.atoms.positions[mt.selectIDs(posselect), :][0]
+            if pots[n] <= med:
+                c = pots[n] / frac1
+            else:
+                c = 0.5 + ( (pots[n] - med) / frac2 ) 
+                
+            ftcl.write('graphics top color {}\n'.format(int(np.ceil(1023*c) + 33)))
+            ftcl.write('graphics top sphere {{{} {} {}}} radius {}\n'.format(
+                r[0], r[1], r[2], 0.03+0.7*(1-c)))
 
 
 
