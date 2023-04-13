@@ -9,6 +9,9 @@ ModelledTrajectory:
 ModelIterator:
     Allows for iteration over a ModelledTrajectory
 
+TrajSlice:
+    Loads (part of) a trajectory into memory, might be better to replace this with passing mda.Universes
+
 
 Functions
 ---------
@@ -21,7 +24,7 @@ vec32array:
 
 Variables
 ---------
-_nbmethods:
+_nbmethods (obsolete as user is now expected to import openmm and can access these classes themselves):
     Dictionary to allow nonbondedMethods to be specified as a string when the class is initialized.
     
 
@@ -42,6 +45,7 @@ from openmmforcefields.generators import GAFFTemplateGenerator
 import MDAnalysis as mda
 from MDAnalysis.analysis import distances
 from MDAnalysis.coordinates.memory import MemoryReader
+from MDAnalysis import transformations
 
 
 
@@ -99,7 +103,7 @@ class ModelledTrajectory:
     '''
     
     def __init__(self, topology, system, integrator, trajTop, trajectory:List[str] = None):
-        ´''' initilizes both an mda universe and an openmm simulation box of the same system to keep in parallel'''
+        ''' initilizes both an mda universe and an openmm simulation box of the same system to keep in parallel'''
         if trajectory == None:
             self._tu = mda.Universe(trajTop)
         else:
@@ -550,9 +554,9 @@ def draw_potential_tcl(mt, df, colname, filename, posselect, sel):
 
 
 
-def solvatePT(newFile:str, forcefield, nSol:int, nosolTop, nosolU, solTop=None, model:str = 'tip3p', boxSize=None, boxVectors=None, padding=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, select:List[int] = []):
+def solvatePT(newFile:str, forcefield, nSol:int, nosolTop, nosolU, solTop=None, model:str = 'tip3p', boxSize=None, boxVectors=None, padding=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, pbar=False, center_on='not water', wrap='water'):
     '''
-    Add water to (selected) frames in the pseudotrajectory and save the result
+    Add water to frames in the pseudotrajectory and save the result
     '''
 
     if solTop == None:
@@ -565,30 +569,37 @@ def solvatePT(newFile:str, forcefield, nSol:int, nosolTop, nosolU, solTop=None, 
 
     solU=mda.Universe(solTop, trajectory=True)
 
-    #TO FIX: get box dimensions from one of the topologies or input (needs to be multiplied because mda takes nm as angstrom)
-    transform = transformations.boxdimensions.set_dimensions([30.0859, 30.0859, 30.0859, 90, 90, 90]) 
+    boxvectors = np.array(vec32array(solTop.getPeriodicBoxVectors(), angstrom))
+    boxfix = transformations.boxdimensions.set_dimensions([boxvectors[0,0], boxvectors[1,1], boxvectors[2,2], 90, 90, 90])
 
+
+    if pbar:
+        iterator=tqdm(nosolU.trajectory)
+    else:
+        iterator = nosolU.trajectory
+    
     with mda.Writer(newFile, solU.atoms.n_atoms) as W:
+        for i, ts in enumerate(iterator):
+            positions = array2vec3(nosolU.atoms.positions/10)
+            mod = app.Modeller(nosolTop, positions)
+            mod.addSolvent(forcefield=forcefield, numAdded=nSol, model=model, boxSize=boxSize, boxVectors=boxVectors, padding=padding,
+                           boxShape=boxShape, positiveIon=positiveIon, negativeIon=negativeIon, ionicStrength=ionicStrength,
+                           neutralize=neutralize)
 
-    for i in nosolU.trajectory[select]:
-        positions = array2vec3(nosolU.atoms.positions/10)
-        mod = app.Modeller(nosolTop, positions)
-        mod.addSolvent(forcefield=forcefield, numAdded=nSol, model=model, boxSize=boxSize, boxVectors=boxVectors, padding=padding,
-                       boxShape=boxShape, positiveIon=positiveIon, negativeIon=negativeIon, ionicStrength=ionicStrength,
-                       neutralize=neutralize)
+            centered = solU.select_atoms(center_on)
+
+            wrapped = solU.select_atoms(wrap)
         
-        solU.load_new(vec32array(mod.getPositions(), angstrom), order='fac')
-        #TO FIX
-        solU.trajectory.add_transformations(transform)
-        cage_center = cage.center_of_mass()
-
-        #ALso part of box dimension fix
-        dim = i.triclinic_dimensions
-        box_center = np.sum(dim, axis=0) / 2
-        solU.atoms.translate(box_center - cage_center)
-        sol.wrap(compound='residues')
-        solU.atoms.translate(-cage.center_of_mass())
-        W.write(solU.atoms)
+            solU.load_new(vec32array(mod.getPositions(), angstrom), order='fac')
+            solU.trajectory.add_transformations(boxfix)
+        
+            dim = boxvectors
+            box_center = np.sum(dim, axis=0) / 2
+        
+            solU.atoms.translate(box_center - centered.center_of_mass())
+            wrapped.wrap(compound='residues')
+            solU.atoms.translate(-centered.center_of_mass())
+            W.write(solU.atoms)
 
     
     
