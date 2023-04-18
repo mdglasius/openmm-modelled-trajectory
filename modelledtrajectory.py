@@ -554,9 +554,50 @@ def draw_potential_tcl(mt, df, colname, filename, posselect, sel):
 
 
 
-def solvatePT(newFile:str, forcefield, nSol:int, nosolTop, nosolU, solTop=None, model:str = 'tip3p', boxSize=None, boxVectors=None, padding=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, pbar=False, center_on='not water', wrap='water'):
+def solvatePT(newFile:str, forcefield, nSol:int, nosolTop:openmm.Topology, nosolU:mda.Universe, solTop:openmm.Topology = None, model:str = 'tip3p', boxSize=None, boxVectors=None, padding=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, pbar=False, center_on='not water', wrap='water'):
     '''
     Add water to frames in the pseudotrajectory and save the result
+
+    Takes an openmm topology and an mda universe of an unsolvated pseudotrajectory and adds the same amount of solvent and ions to each frame in the PT.
+    Uses the openmm Modeller.addSolvent function to do this. Relevant parameters are passed on to addSolvent. 
+    Though a forcefield is required for the Modeller, it does not necessarily need to be the forcefield used for eventual calculations done on the PT if only atom coordinates are needed from this function.
+
+    Note that though boxShape is passed to addSolvent, only cubic boxes are supported at this time! This is due to the translations done to realign the frames in the PT after solvation
+
+    Parameters
+    ----------
+    newfile (string):
+        Name of the file for the new solvated pseudotrajectory. Extension in the filename determines type, as handled by the MDAnalysis writer
+
+    forcefield (openmm ForceField):
+        A forcefield for the openmm modeller to work with.
+
+    nSol (integer):
+        The number of solvent molecules to add to each trajectory frame.
+
+    nosolTop (openmm Topology): 
+        Topology representing the system without solvent.
+
+    nosolU (MDAnalysis Universe):
+        Universe representing the unsolvated trajectory that this function should add solvent to.
+
+    solTOp (openmm Topology):
+        Topology representative of the system after solvent has been added. Not essential as it can be taken from the modeller, but that requires a bit of extra work.
+        Providing the correct topology might also reveal errors in the way solvent is added if the result of addSolvent does not match the desired topology.
+
+    center_on (string):
+        MDA atom select language that specifies which part of the system should be kept central in the simulation box across the whole PT
+
+    wrap (string):
+        MDA atom select language that specifies the part of the system that can be safely wrapped around to the other side of the simulation box when centering on the part specified in center_on. 
+
+    pbar (Boolean):
+        If True provides an in terminal progress bar
+
+
+    All other parameters are directly passed on to addSolvent. For specific information on those see the openmm documentation for Modeller.addSolvent()
+    
+
     '''
 
     if solTop == None:
