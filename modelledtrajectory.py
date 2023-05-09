@@ -47,7 +47,15 @@ from MDAnalysis.analysis import distances
 from MDAnalysis.coordinates.memory import MemoryReader
 from MDAnalysis import transformations
 
+from sklearn.preprocessing import normalize
+from scipy.sparse.linalg import eigs
+from scipy.sparse import csr_matrix
 
+import os
+import re
+import pandas as pd
+
+import time
 
 '''
 Classes
@@ -115,6 +123,7 @@ class ModelledTrajectory:
         self._system = system
         self._integrator = integrator
         self._simulation = app.Simulation(self._topology, self._system, self._integrator)
+        self[0]
 
     def __getitem__(self, index:int):
         '''Change the coordinates in the simulation box to frame index'''
@@ -130,9 +139,12 @@ class ModelledTrajectory:
         return len(self._tu.trajectory)
             
 
-    def frames(self, trajslice = None, select:List[int]=[]):
+    def frames(self, trajslice = None, select:List[int]=[], lazy=False, IDs = None):
         '''Iterate over (a slice of ) the trajectory, or a different trajectory for the same system'''
-        return ModelIterator(self, trajslice, select)
+        if lazy:
+            return LazyIterator(self, IDs, trajslice, select)
+        else:
+            return ModelIterator(self, trajslice, select)
 
     
     def getPotentialEnergy(self, returnQuantity:bool = False):
@@ -152,7 +164,7 @@ class ModelledTrajectory:
         self._simulation.minimizeEnergy(tolerance = Quantity(value=tolerance, unit=kilojoule/mole), maxIterations=maxIterations)
         
     
-    def gridSim(self, steps:int, forcePicks:List[int], outputfolder:str = 'output', reportsteps:int = 0, select:List[int]=[], saveCheckpoint:bool = False):
+    def gridSim(self, steps:int, probeIDs, outputfolder:str = 'output', reportsteps:int = 0, select:List[int]=[], saveCheckpoint:bool = False, pbar = False):
         '''
         Run a Simulation on each (selected) point in the pseudotrajectory/grid. 
 
@@ -172,11 +184,12 @@ class ModelledTrajectory:
                 f.setForceGroup(i)
                 forcenames.append(f.getName())
 
-        with open(outputfolder+'/forces.txt', 'w') as ff:
-            ff.write(str(forcenames))
-        
-        
-        for i in self.frames(select=select):
+        if pbar:
+            iterator = tqdm(self.frames(select=select))
+        else:
+            iterator = self.frames(select=select)
+                
+        for i in iterator:
             if select == []:
                 n = i
             else:
@@ -190,9 +203,8 @@ class ModelledTrajectory:
                     print('Integrator has no temperature to set velocities')
                     tfailed = True
                 
-                
             self._simulation.reporters.append(app.DCDReporter(outputfolder+'/trajectory_{}.dcd'.format(n), reportsteps))
-            self._simulation.reporters.append(ProbeReporter(outputfolder+'/data_{}.csv'.format(n), reportsteps, forcePicks, len(self._system.getForces())))
+            self._simulation.reporters.append(ProbeReporter(outputfolder+'/data_{}.csv'.format(n), reportsteps, probeIDs, len(forcenames), forcenames))
             try:
                 self._simulation.step(steps)
             except:
@@ -211,7 +223,7 @@ class ModelledTrajectory:
         return success, fail
 
 
-    def gridMinimize(self, maxIt:int = 0, tfile:str = 'minimized_trajectory.dcd', select:List[int]=[], printProgress = False):
+    def gridMinimize(self, maxIt:int = 0, tfile:str = 'minimized_trajectory.dcd', select:List[int]=[], printProgress = False, pbar=False, lazy=False, lazyIDs = None, tolerance=10):
         '''
         Run a Simulation on each (selected) point in the pseudotrajectory/grid. 
 
@@ -219,15 +231,21 @@ class ModelledTrajectory:
         success = []
         fail = []
 
+        if pbar:
+            iterator = tqdm(self.frames(select=select, lazy=lazy, IDs=lazyIDs))
+        else:
+            iterator = self.frames(select=select, lazy=lazy, IDs=lazyIDs)
+
         rep = app.DCDReporter(tfile, 1)
-        for i in self.frames(select=select):
+        for i in iterator:
             if select == []:
                 n = i
             else:
                 n = select[i]
             try:
-                self._simulation.minimizeEnergy(maxIterations = maxIt)
-            except:
+                self._simulation.minimizeEnergy(maxIterations = maxIt, tolerance=Quantity(value=tolerance, unit=kilojoule/mole))
+            except Exception as e:
+                print(e)
                 if printProgress:
                     print('Minimization of gridpoint {} failed'.format(n))
                 fail.append(n)
@@ -240,6 +258,9 @@ class ModelledTrajectory:
             
         return success, fail
 
+
+
+    
     def getForceNames(self):
         return [f.getName() for f in self._system.getForces()]
 
@@ -389,6 +410,72 @@ class ModelIterator:
         return self.numits
 
 
+class LazyIterator:
+    '''
+    Iterator over the specified frames in a modelledtrajectory.
+
+    Will iterate over the entire trajectory and, at each iteration, set the simulation coordinates to that frame. Takes a list of integers as an optional argument, if provided will iterate over those frames and in that specific order.
+
+    Arguments
+    ---------
+    sim (openmm.app.simulation.Simulation):
+        The openMM simulation box that is changed for each iteration
+
+    trajectory: numpy array of atom coordinates per frame to loop over.
+
+    select ( [int] ): Optional list of integers. When specified will iterate over the specific frames in this list.
+    '''
+    
+    def __init__(self, mt:ModelledTrajectory, moveIDs, trajectory = None, select:List[int] = []):
+        self.numits = len(mt)
+        self.sb = False
+        self.tb = False
+        self.mt = mt
+        self.iteration = 0
+        self.IDs = moveIDs     
+ 
+        
+        if trajectory != None:
+            self.numits = len(trajectory)
+            self.trajectory = trajectory
+            self.tb = True
+            
+        if select != []:
+            self.numits = len(select)
+            self.select = select
+            self.sb = True
+        
+        
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.iteration < self.numits:
+            if self.sb:
+                i = self.select[self.iteration]
+            else:
+                i = self.iteration
+            
+            if self.tb:
+                curpos = array2vec3([vec for vec in self.trajectory[i]], nanometer)
+            else:
+                state = self.mt._simulation.context.getState(getPositions=True)
+                curpos = np.array(state.getPositions())
+                self.mt._tu.trajectory[i]
+                newpos = np.array(array2vec3([atm.position/10 for atm in self.mt._tu.atoms]))
+                
+                curpos[self.IDs] = newpos[self.IDs]
+                
+            self.mt._simulation.context.setPositions(curpos)
+            self.iteration += 1
+            return (self.iteration - 1)
+            
+    
+        else:
+            self.mt[0]
+            raise StopIteration
+    def __len__(self):
+        return self.numits
 
 
 
@@ -457,11 +544,21 @@ class TrajSlice:
 
 class ProbeReporter():
 
-    def __init__(self, f:str, reportInterval:int, selection:List[int], nforcegroups:int = 1):
+    def __init__(self, f:str, reportInterval:int, selection:List[int],  nforcegroups:int = 1, forcenames:List[str] = '', pot_unit=(kilojoules/mole), f_unit=(kilojoules/mole/nanometer) ):
         self._out = open(f, 'w')
         self._reportInterval = reportInterval
         self._probeIDs = selection
         self._nf = nforcegroups
+        if forcenames != '':
+            column_names = [n+'Ene,'+n for n in forcenames]
+            if len(column_names) != self._nf:
+                print('Warning: number of specified column names does not match number of output columns')
+            self._out.write(','.join(['step']+column_names)+'\n')
+        else:
+            self._out.write(','.join(['step','potential','force','\n']))
+
+        self.pot_unit = pot_unit
+        self.f_unit = f_unit
 
     def __del__(self):
         self._out.close()
@@ -470,19 +567,143 @@ class ProbeReporter():
         steps = self._reportInterval - simulation.currentStep%self._reportInterval
         return (steps, False, False, False, False, None)
 
-    def report(self, simulation, state):
-        data = ['']*self._nf
+    def report(self, simulation=None, state=None, mt=None):
+        data = ['']*(self._nf)
+        if simulation == None:
+            simulation = mt._simulation
+        
         for i in range(self._nf):
             s2 = simulation.context.getState(getForces=True, getEnergy=True, groups = {i})
-            forces = s2.getForces(asNumpy=True).value_in_unit(kilojoules/mole/nanometer)
-            pot = s2.getPotentialEnergy().value_in_unit(kilojoules/mole)
+            forces = s2.getForces(asNumpy=True).value_in_unit(self.f_unit)
+            pot = s2.getPotentialEnergy().value_in_unit(self.pot_unit)
 
             data[i] = str(pot)+','+str(np.array(np.mean(forces[self._probeIDs], 0)))
             
-        self._out.write(','.join(data)+'\n')
+        self._out.write(','.join([str(simulation.currentStep)] + data)+'\n')
         
 
+class DataIterator:
+    
+    def __init__(self, foldername, topology):
+        files = [x for x in os.listdir(foldername) if os.path.isfile('/'.join([foldername, x]))]
+        self.foldername = foldername
+        self.universe = mda.Universe(topology, trajectory=True)
+        splitfiles = [re.split('\.|_', x) for x in files]
+        spldata = np.array([x for x in splitfiles if x[0] == 'data'])
+        spltraj = np.array([x for x in splitfiles if x[0] == 'trajectory'])
+        assert len(spldata) == len(spltraj),'found different number of data and trajectory files: {} and {}'.format(len(self.datafiles), len(self.trajfiles))
+        
+        self.numits = len(spldata)
+
+        dindex = np.int_(spldata[:, 1])
+        tindex = np.int_(spldata[:, 1])
+        
+        dsort = np.argsort(dindex)
+        tsort = np.argsort(tindex)
+        #print(dindex[dsort].shape,tindex[tsort].shape)
+        assert (dindex[dsort] == tindex[tsort]).all(), 'indices of data files do not match indices of trajectory files'
+
+   
+
+        self.datafiles = ['{}_{}.{}'.format(*x) for x in spldata[dsort]]
+        self.trajfiles = ['{}_{}.{}'.format(*x) for x in spltraj[tsort]]
+        self.indices = dindex[dsort]
+        
+        self.iteration = 0
+
+        self.failed_to_read = []
+   
+        
+
+                
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.iteration < self.numits:
+            dfile =  '/'.join([self.foldername, self.datafiles[self.iteration]])
+            tfile = '/'.join([self.foldername, self.trajfiles[self.iteration]])
+
+            try:
+                df = pd.read_csv(dfile)
+                assert len(df) > 0
+                self.universe.load_new(tfile)
+            except:
+                self.failed_to_read.append(self.iteration)
+                self.iteration += 1
+                return next(self)
+            else:
+                self.iteration += 1
+                return self.iteration-1, df, self.universe
             
+    
+        else:
+            
+            if len(self.failed_to_read) > 0:
+                msg = 'Failed to read following gridpoints, likely empty files: ' + '{}' +', {}'*(len(self.failed_to_read)-1)
+                print(msg.format(*self.failed_to_read))
+            raise StopIteration
+        
+    def __len__(self):
+        return self.numits
+
+
+
+class Timer:
+    def __init__(self, output='time.txt'):
+       self.file = open(output, 'w')
+       self.times = {}
+       self.file.write('Timings recorded by Timer object: \n')
+       self.counter = 0
+       self.t0 = time.time()
+       
+    def __enter__(self):
+        return self
+    
+    def __exit__(self):
+        self.file.write('total time elapsed since start of timer: {}\n'.format(time.time() - self.t0))
+        self.file.close()
+
+    def __del__(self):
+        self.__exit__()
+        
+    def tic(self, label:str):
+        self.times[label] = time.time()
+
+    def toc(self, label:str):
+        t = np.around(time.time()-self.times[label], 2)
+        self.file.write('{} | label: {} | time: {} seconds \n'.format(self.counter, label, t))
+        del self.times[label]
+        self.counter += 1
+
+class MDAReporter:
+    def __init__(self, f:str, reportInterval:int, selection_phrase:str, topology):
+        self._refU = mda.Universe(topology, trajectory = True)
+        self._repGroup = self._refU.select_atoms(selection_phrase)
+        self._out = mda.Writer(f, len(self._repGroup))
+        self._reportInterval = reportInterval
+        
+    def __del__(self):
+        self._out.close()
+
+    def describeNextReport(self, simulation):
+        steps = self._reportInterval - simulation.currentStep%self._reportInterval
+        return (steps, True, False, False, False, None)
+
+    def report(self, simulation, state):
+        positions = vec32array(state.getPositions(), angstrom)
+        self._refU.load_new(positions, order='fac')
+        self._out.write(self._repGroup)
+
+    def save_extra_file(self, f:str, selection_phrase:str, positions):
+        self._refU.load_new(positions, order='fac')
+        tempGroup = self._refU.select_atoms(selection_phrase)
+        with mda.Writer(f, len(tempGroup)) as tempw:
+            tempw.write(tempGroup)
+        
+    
+  
+    
 '''
 Functions
 ---------
@@ -554,7 +775,58 @@ def draw_potential_tcl(mt, df, colname, filename, posselect, sel):
 
 
 
-def solvatePT(newFile:str, forcefield, nSol:int, nosolTop:openmm.Topology, nosolU:mda.Universe, solTop:openmm.Topology = None, model:str = 'tip3p', boxSize=None, boxVectors=None, padding=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, pbar=False, center_on='not water', wrap='water'):
+def draw_molgri_eigenvector_tcl(eig, grid, filename, pbar=False, scale=1.0, res=6, scale_constant=0.0, scale_coords=1.0):
+
+    absmax = np.max(np.abs(eig))
+    coords = grid.get_flat_position_grid()
+    
+    if pbar:
+        it = tqdm(range(len(eig)))
+    else:
+        it = range(len(eig))
+        
+    with open(filename+'.tcl', 'w') as ftcl:
+        
+        ftcl.write('color scale method GWR\n')
+        
+        for i in it:
+            r = coords[i,:]*scale_coords
+            size = np.abs(eig[i])
+            
+            if eig[i] < 0:
+                color = 1
+            else:
+                color = 7
+                
+            ftcl.write('graphics top color {}\n'.format(color))
+            ftcl.write('graphics top sphere {{{} {} {}}} radius {} resolution {}\n'.format(
+                r[0], r[1], r[2],0.2*size*scale + scale_constant, res ))
+    
+
+
+def eigspertau(states, nstates, nsteps, k=6, returnvecs=False, forceBalance=False):
+    tlen = len(states)
+    irow = np.zeros(tlen-nsteps)
+    jcol = np.zeros(tlen-nsteps)
+    data = np.zeros(tlen-nsteps)
+    
+    for x in range(tlen-nsteps):
+        irow[x] = states[x]
+        jcol[x] = states[x+nsteps]
+        data[x] = 1
+
+    C = csr_matrix((data, (irow, jcol)), shape=(nstates, nstates))
+
+    if forceBalance:
+        C = C + C.transpose()
+
+    T = normalize(C, norm='l1', axis=1)
+    
+    return eigs(T, k=k, return_eigenvectors=returnvecs) 
+
+                       
+
+def solvatePT(newFile:str, forcefield, nSol:int, nosolTop, nosolU, solTop = None, model:str = 'tip3p', boxSize=None, boxVectors=None, padding=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, pbar=False, center_on='not water', wrap_atoms = 'water'):
     '''
     Add water to frames in the pseudotrajectory and save the result
 
@@ -629,8 +901,8 @@ def solvatePT(newFile:str, forcefield, nSol:int, nosolTop:openmm.Topology, nosol
 
             centered = solU.select_atoms(center_on)
 
-            wrapped = solU.select_atoms(wrap)
-        
+            wrapped = solU.select_atoms(wrap_atoms)
+         
             solU.load_new(vec32array(mod.getPositions(), angstrom), order='fac')
             solU.trajectory.add_transformations(boxfix)
         
